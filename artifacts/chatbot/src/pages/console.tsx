@@ -1018,7 +1018,21 @@ function TestChatPanel() {
 type FetchedModel = { id: string; owned_by?: string };
 
 // ─── Pool key stored in localStorage ─────────────────────────────────────────
-type PoolKey = { id: string; label: string; key: string; isActive: boolean };
+type PoolKeyApiType = "auto" | "openai" | "codex" | "anthropic";
+type PoolKey = { id: string; label: string; key: string; isActive: boolean; apiType?: PoolKeyApiType };
+
+const API_TYPE_LABELS: Record<PoolKeyApiType, string> = {
+  auto: "Auto",
+  openai: "OpenAI",
+  codex: "Codex",
+  anthropic: "Anthropic",
+};
+const API_TYPE_COLORS: Record<PoolKeyApiType, string> = {
+  auto: "bg-violet-500/10 text-violet-400",
+  openai: "bg-emerald-500/10 text-emerald-400",
+  codex: "bg-blue-500/10 text-blue-400",
+  anthropic: "bg-amber-500/10 text-amber-400",
+};
 
 function loadPoolKeys(slug: string): PoolKey[] {
   try {
@@ -1055,6 +1069,7 @@ function CustomProviderKeyPanel({ provider }: { provider: CustomProvider }) {
   const [showForm, setShowForm] = useState(false);
   const [formLabel, setFormLabel] = useState("");
   const [formKey, setFormKey] = useState("");
+  const [formApiType, setFormApiType] = useState<PoolKeyApiType>("auto");
   const [showFormKey, setShowFormKey] = useState(false);
   const [copiedKeyId, setCopiedKeyId] = useState("");
 
@@ -1063,8 +1078,8 @@ function CustomProviderKeyPanel({ provider }: { provider: CustomProvider }) {
   const addKey = () => {
     if (!formKey.trim()) return;
     const label = formLabel.trim() || `Key ${keys.length + 1}`;
-    persist([...keys, { id: crypto.randomUUID(), label, key: formKey.trim(), isActive: true }]);
-    setFormLabel(""); setFormKey(""); setShowForm(false); setShowFormKey(false);
+    persist([...keys, { id: crypto.randomUUID(), label, key: formKey.trim(), isActive: true, apiType: formApiType }]);
+    setFormLabel(""); setFormKey(""); setFormApiType("auto"); setShowForm(false); setShowFormKey(false);
   };
 
   const delKey = (id: string) => persist(keys.filter(k => k.id !== id));
@@ -1162,9 +1177,20 @@ function CustomProviderKeyPanel({ provider }: { provider: CustomProvider }) {
                 {showFormKey ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
               </button>
             </div>
+            {/* Connection type */}
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-muted-foreground/50 font-sans w-24 flex-none">نوع الاتصال</span>
+              <select value={formApiType} onChange={e => setFormApiType(e.target.value as PoolKeyApiType)}
+                className="flex-1 h-7 rounded-md border border-border/40 bg-background/60 text-xs px-2 font-mono focus:outline-none focus:ring-1 focus:ring-primary/50">
+                <option value="auto">Auto (يجرّب تلقائياً)</option>
+                <option value="openai">OpenAI Completions (/v1/chat/completions)</option>
+                <option value="codex">Codex Responses (/v1/responses)</option>
+                <option value="anthropic">Anthropic Messages (/v1/messages)</option>
+              </select>
+            </div>
             <div className="flex justify-end gap-2">
               <Button size="sm" variant="ghost" className="h-7 text-xs"
-                onClick={() => { setShowForm(false); setFormLabel(""); setFormKey(""); setShowFormKey(false); }}>
+                onClick={() => { setShowForm(false); setFormLabel(""); setFormKey(""); setFormApiType("auto"); setShowFormKey(false); }}>
                 إلغاء
               </Button>
               <Button size="sm" className="h-7 px-3 text-xs" onClick={addKey} disabled={!formKey.trim()}>
@@ -1186,10 +1212,15 @@ function CustomProviderKeyPanel({ provider }: { provider: CustomProvider }) {
                 ${k.isActive ? "" : "opacity-50"}`}>
                 <div className="flex-none w-4 text-[9px] text-muted-foreground/30 text-center">{i + 1}</div>
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <span className="text-xs font-medium">{k.label}</span>
                     {i === 0 && k.isActive && (
                       <span className="text-[8px] uppercase tracking-wider px-1 py-0.5 rounded bg-emerald-500/10 text-emerald-500/70">primary</span>
+                    )}
+                    {k.apiType && (
+                      <span className={`text-[8px] uppercase tracking-wider px-1 py-0.5 rounded ${API_TYPE_COLORS[k.apiType]}`}>
+                        {API_TYPE_LABELS[k.apiType]}
+                      </span>
                     )}
                   </div>
                   <code className="text-[10px] text-muted-foreground/50 font-mono">{maskKey(k.key)}</code>

@@ -1034,4 +1034,228 @@ router.post("/chat/stream", async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// CUSTOM PROVIDER STREAM  — POST /chat/custom-stream
+// Accepts: { baseUrl, apiKey, apiType, model, messages, system }
+// apiType: "auto" | "openai" | "codex" | "anthropic"
+// When "auto": tries openai → codex → anthropic until one succeeds.
+// ════════════════════════════════════════════════════════════════════════════
+
+type CustomApiType = "openai" | "codex" | "anthropic";
+
+type CustomWireMessage = { role: string; content: string };
+
+function buildCustomUpstream(
+  base: string,
+  type: CustomApiType,
+  apiKey: string | undefined,
+  model: string,
+  messages: CustomWireMessage[],
+  systemMsg: string,
+): { url: string; headers: Record<string, string>; body: unknown } {
+  const auth: Record<string, string> = apiKey
+    ? { Authorization: `Bearer ${apiKey}` }
+    : {};
+
+  if (type === "openai") {
+    const allMsgs = systemMsg
+      ? [{ role: "system", content: systemMsg }, ...messages]
+      : messages;
+    return {
+      url: `${base}/v1/chat/completions`,
+      headers: { "Content-Type": "application/json", ...auth },
+      body: { model, messages: allMsgs, stream: true },
+    };
+  }
+
+  if (type === "codex") {
+    const inputMsgs = systemMsg
+      ? [{ role: "system", content: systemMsg }, ...messages]
+      : messages;
+    return {
+      url: `${base}/v1/responses`,
+      headers: { "Content-Type": "application/json", ...auth },
+      body: { model, input: inputMsgs, stream: true },
+    };
+  }
+
+  // anthropic
+  return {
+    url: `${base}/v1/messages`,
+    headers: {
+      "Content-Type": "application/json",
+      "anthropic-version": "2023-06-01",
+      ...(apiKey ? { "x-api-key": apiKey } : {}),
+    },
+    body: {
+      model,
+      messages,
+      system: systemMsg || undefined,
+      max_tokens: 16384,
+      stream: true,
+    },
+  };
+}
+
+function parseCustomChunk(
+  type: CustomApiType,
+  jsonStr: string,
+  lastEvent: string,
+): string | null {
+  try {
+    const chunk = JSON.parse(jsonStr) as Record<string, unknown>;
+
+    if (type === "openai") {
+      // Standard SSE delta
+      const choices = chunk.choices as Array<{ delta?: { content?: string } }> | undefined;
+      const text = choices?.[0]?.delta?.content;
+      if (text) return text;
+      // Responses API delta (event: response.output_text.delta)
+      if (lastEvent === "response.output_text.delta" || chunk.type === "response.output_text.delta") {
+        const delta = chunk.delta as string | undefined;
+        if (delta) return delta;
+      }
+      return null;
+    }
+
+    if (type === "codex") {
+      // Codex /v1/responses SSE events
+      if (lastEvent === "response.output_text.delta" || chunk.type === "response.output_text.delta") {
+        const delta = chunk.delta as string | undefined;
+        if (delta) return delta;
+      }
+      // Also handle openai-like delta in case the provider maps it
+      const choices = chunk.choices as Array<{ delta?: { content?: string } }> | undefined;
+      const content = choices?.[0]?.delta?.content;
+      if (content) return content;
+      return null;
+    }
+
+    // anthropic
+    if (lastEvent === "content_block_delta") {
+      const delta = chunk.delta as { type?: string; text?: string } | undefined;
+      if (delta?.type === "text_delta" && delta.text) return delta.text;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+router.post("/chat/custom-stream", async (req, res) => {
+  const {
+    baseUrl,
+    apiKey,
+    apiType,
+    model,
+    messages,
+    system,
+  } = req.body as {
+    baseUrl?: string;
+    apiKey?: string;
+    apiType?: "auto" | CustomApiType;
+    model?: string;
+    messages?: CustomWireMessage[];
+    system?: string;
+  };
+
+  if (!baseUrl || !model) {
+    res.status(400).json({ error: "baseUrl and model are required" });
+    return;
+  }
+  if (!messages || !Array.isArray(messages)) {
+    res.status(400).json({ error: "messages array is required" });
+    return;
+  }
+
+  const base = baseUrl.replace(/\/$/, "");
+  const systemMsg = system || "You are a helpful AI assistant.";
+
+  const typesToTry: CustomApiType[] =
+    !apiType || apiType === "auto"
+      ? ["openai", "codex", "anthropic"]
+      : [apiType];
+
+  const flush = () => (res as unknown as { flush?: () => void }).flush?.();
+  const sendText = (text: string) => {
+    res.write(`data: ${JSON.stringify({ type: "text-delta", id: "0", text })}\n\n`);
+    flush();
+  };
+
+  let lastError = "";
+
+  for (const type of typesToTry) {
+    const { url, headers, body } = buildCustomUpstream(base, type, apiKey, model, messages, systemMsg);
+
+    try {
+      const upstream = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30_000),
+      });
+
+      if (!upstream.ok) {
+        const text = await upstream.text().catch(() => `HTTP ${upstream.status}`);
+        lastError = text.slice(0, 300);
+        req.log.warn({ type, status: upstream.status, url }, "custom-stream attempt failed, trying next");
+        continue;
+      }
+
+      // ── Stream found — start SSE ─────────────────────────────────────────
+      req.log.info({ type, url }, "custom-stream connected");
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+      res.setHeader("X-Custom-Api-Type", type);
+      (res.socket as import("node:net").Socket | null)?.setNoDelay?.(true);
+      res.flushHeaders();
+
+      if (!upstream.body) { res.write("data: [DONE]\n\n"); res.end(); return; }
+
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let lastEvent = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (line.startsWith("event:")) { lastEvent = line.slice(6).trim(); continue; }
+          if (!line.startsWith("data:")) { lastEvent = ""; continue; }
+          const jsonStr = line.slice(5).trim();
+          if (jsonStr === "[DONE]") { lastEvent = ""; continue; }
+
+          const text = parseCustomChunk(type, jsonStr, lastEvent);
+          if (text) sendText(text);
+          lastEvent = "";
+        }
+      }
+
+      res.write("data: [DONE]\n\n");
+      flush();
+      res.end();
+      return;
+    } catch (err) {
+      lastError = String(err).slice(0, 200);
+      req.log.warn({ type, err }, "custom-stream attempt error, trying next");
+    }
+  }
+
+  // All types failed
+  req.log.error({ baseUrl, model, typesToTry, lastError }, "custom-stream: all types failed");
+  if (!res.headersSent) {
+    res.status(502).json({
+      error: `فشل الاتصال بـ ${base}. جُرِّبت الأنواع: ${typesToTry.join(", ")}. آخر خطأ: ${lastError}`,
+    });
+  }
+});
+
 export default router;
